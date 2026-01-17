@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir /b \"C:\\\\Users\\\\satui\\\\OneDrive\\\\Documents\\\\Arduino\\\\libraries\")",
+      "mcp__context7__resolve-library-id"
+    ]
+  }
+}

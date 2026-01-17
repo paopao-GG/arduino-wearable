@@ -1,0 +1,1 @@
+C:\Users\satui\OneDrive\Documents\Arduino\libraries
