@@ -3,16 +3,12 @@
 #include "Pulse.h"
 #include <avr/pgmspace.h>
 
-// Routines to clear and set bits 
-#ifndef cbi
-#define cbi(sfr, bit) (_SFR_BYTE(sfr) &= ~_BV(bit))
-#endif
-#ifndef sbi
-#define sbi(sfr, bit) (_SFR_BYTE(sfr) |= _BV(bit))
-#endif
+// TaskScheduler configuration - MUST be before include
+#define _TASK_MICRO_RES          // Microsecond resolution for precise timing
+#define _TASK_PRIORITY           // Enable layered priority scheduling
+#include <TaskScheduler.h>
 
-
-SSD1306 oled; 
+SSD1306 oled;
 MAX30102 sensor;
 Pulse pulseIR;
 Pulse pulseRed;
@@ -25,9 +21,10 @@ MAFilter bpm;
 // Threshold and timing constants
 #define FINGER_THRESHOLD 5000   // IR value below this = no finger detected
 #define MAX_BPM 200             // Maximum valid heart rate
-#define DISPLAY_INTERVAL 50     // Display update interval (ms)
+#define SENSOR_INTERVAL 4000    // Sensor read interval (4ms = 250Hz, matches MAX30102 sample rate)
+#define DISPLAY_INTERVAL 50000  // Display update interval (50ms in microseconds)
 #define BEAT_FLASH_DURATION 30  // LED/buzzer flash duration (ms)
-#define TEMP_READ_INTERVAL 1000 // Temperature read interval (ms)
+#define TEMP_READ_INTERVAL 1000000 // Temperature read interval (1s in microseconds)
 
 static const uint8_t heart_bits[] PROGMEM = { 0x00, 0x00, 0x38, 0x38, 0x7c, 0x7c, 0xfe, 0xfe, 0xfe, 0xff, 
                                         0xfe, 0xff, 0xfc, 0x7f, 0xf8, 0x3f, 0xf0, 0x1f, 0xe0, 0x0f,
@@ -40,12 +37,19 @@ static const uint8_t heart_bits[] PROGMEM = { 0x00, 0x00, 0x38, 0x38, 0x7c, 0x7c
 
 
 void print_digit(int x, int y, long val, char c=' ', uint8_t field = 3,const int BIG = 2)
-    {  
+    {
     uint8_t ff = field;
-    do { 
-        char ch = (val!=0) ? val%10+'0': c;
+    bool first = true;  // Track if we're on the rightmost digit
+    do {
+        char ch;
+        if (first || val != 0) {
+            ch = val % 10 + '0';  // Always show at least the last digit
+            first = false;
+        } else {
+            ch = c;  // Padding character for leading positions
+        }
         oled.drawChar( x+BIG*(ff-1)*6, y, ch, BIG);
-        val = val/10; 
+        val = val/10;
         --ff;
     } while (ff>0);
 }
@@ -164,12 +168,40 @@ private:
 
 } wave;
 
-int  beatAvg;
-int  SPO2;
-int  temperature;  // Temperature in Celsius (integer)
+int  beatAvg = 0;
+int  SPO2 = 99;        // Default to 99% until first reading
+int  temperature = 0;  // Temperature in Celsius (integer)
 const bool filter_for_graph = false;  // Set true to filter before graphing
 const bool draw_Red = false;          // Set true to display Red signal instead of IR
-bool buzzer_on = false;
+
+// Beat detection state (shared between tasks)
+volatile bool fingerPresent = false;
+volatile unsigned long lastBeatTime = 0;
+
+// Priority-based TaskSchedulers (highest priority runs first on every pass)
+// Sensor scheduler runs on EVERY pass - never misses a beat
+Scheduler sensorScheduler;   // HIGHEST priority - sensor + buzzer
+Scheduler displayScheduler;  // LOW priority - display + temp (can be delayed)
+
+// Forward declarations for task callbacks
+void sensorCallback();
+void displayCallback();
+void tempCallback();
+void buzzerOffCallback();
+
+// HIGHEST PRIORITY: Sensor task (runs every 4ms = 250Hz)
+// This task runs on every scheduler pass, even during display updates
+Task taskSensor(SENSOR_INTERVAL, TASK_FOREVER, &sensorCallback, &sensorScheduler, true);
+
+// HIGHEST PRIORITY: Buzzer off task (one-shot, triggered by beat)
+Task taskBuzzerOff(BEAT_FLASH_DURATION * 1000, TASK_ONCE, &buzzerOffCallback, &sensorScheduler, false);
+
+// LOW PRIORITY: Display update (every 50ms = 20Hz)
+// Display is slow but sensor still runs during display update
+Task taskDisplay(DISPLAY_INTERVAL, TASK_FOREVER, &displayCallback, &displayScheduler, true);
+
+// LOW PRIORITY: Temperature reading (every 1 second)
+Task taskTemp(TEMP_READ_INTERVAL, TASK_FOREVER, &tempCallback, &displayScheduler, true);
 
 // Temperature smoothing filter (8-sample moving average)
 #define TEMP_SAMPLES 8
@@ -244,97 +276,154 @@ void setup(void) {
   oled.init();
   oled.fill(0x00);
   draw_oled(3);
-  delay(3000); 
+  delay(3000);
   if (!sensor.begin())  {
     draw_oled(0);
     while (1);
   }
-  sensor.setup(); 
+  sensor.setup();
+
+  // Link priority schedulers: displayScheduler -> sensorScheduler (highest)
+  // sensorScheduler runs on EVERY pass of displayScheduler
+  displayScheduler.setHighPriorityScheduler(&sensorScheduler);
+
+  // Enable all tasks in both schedulers
+  displayScheduler.enableAll(true);  // true = recursive, enables sensorScheduler tasks too
+
+  // Sync timing
+  displayScheduler.startNow(true);   // true = recursive
 }
 
-long lastBeat = 0;    //Time of the last beat
-long displaytime = 0; //Time of the last display update
-long tempReadTime = 0; //Time of the last temperature update
-bool led_on = false;
-
-
 void loop()  {
+    // Execute the base scheduler - it will automatically run high priority scheduler first
+    displayScheduler.execute();
+}
+
+/*
+ * SENSOR TASK - High priority, runs every 4ms (250Hz)
+ * Reads MAX30102, detects beats, triggers immediate buzzer/LED response
+ */
+void sensorCallback() {
     sensor.check();
-    long now = millis();   //start time of this cycle
     if (!sensor.available()) return;
-    uint32_t irValue = sensor.getIR(); 
+
+    uint32_t irValue = sensor.getIR();
     uint32_t redValue = sensor.getRed();
     sensor.nextSample();
-    if (irValue < FINGER_THRESHOLD) {
-        draw_oled(1);  // finger not down message
-        delay(200);
+
+    // Check finger presence
+    fingerPresent = (irValue >= FINGER_THRESHOLD);
+    if (!fingerPresent) return;
+
+    // Signal processing
+    int16_t IR_signal, Red_signal;
+    bool beatRed, beatIR;
+
+    if (!filter_for_graph) {
+       IR_signal =  pulseIR.dc_filter(irValue);
+       Red_signal = pulseRed.dc_filter(redValue);
+       beatRed = pulseRed.isBeat(pulseRed.ma_filter(Red_signal));
+       beatIR =  pulseIR.isBeat(pulseIR.ma_filter(IR_signal));
     } else {
-        // remove DC element
-        int16_t IR_signal, Red_signal;
-        bool beatRed, beatIR;
-        if (!filter_for_graph) {
-           IR_signal =  pulseIR.dc_filter(irValue) ;
-           Red_signal = pulseRed.dc_filter(redValue);
-           beatRed = pulseRed.isBeat(pulseRed.ma_filter(Red_signal));
-           beatIR =  pulseIR.isBeat(pulseIR.ma_filter(IR_signal));        
-        } else {
-           IR_signal =  pulseIR.ma_filter(pulseIR.dc_filter(irValue)) ;
-           Red_signal = pulseRed.ma_filter(pulseRed.dc_filter(redValue));
-           beatRed = pulseRed.isBeat(Red_signal);
-           beatIR =  pulseIR.isBeat(IR_signal);
-        }
-        // Check for heartbeat
-        bool beatDetected = draw_Red ? beatRed : beatIR;
+       IR_signal =  pulseIR.ma_filter(pulseIR.dc_filter(irValue));
+       Red_signal = pulseRed.ma_filter(pulseRed.dc_filter(redValue));
+       beatRed = pulseRed.isBeat(Red_signal);
+       beatIR =  pulseIR.isBeat(IR_signal);
+    }
 
-        // Record ECG-style waveform (triggers PQRST pattern on beat detection)
-        wave.record(beatDetected);
+    // Check for heartbeat
+    bool beatDetected = draw_Red ? beatRed : beatIR;
 
-        if (beatDetected) {
-            long btpm = 60000/(now - lastBeat);
-            if (btpm > 0 && btpm < MAX_BPM) beatAvg = bpm.filter((int16_t)btpm);
-            lastBeat = now;
-            digitalWrite(LED, HIGH);
-            digitalWrite(BUZZER, HIGH);  // Active buzzer ON
-            buzzer_on = true;
-            led_on = true;
-            // Compute SpO2 using R ratio: R = (RedAC/RedDC) / (IRAC/IRDC)
-            // Rearranged to avoid floating point: R*100 = (RedAC * IRDC * 100) / (RedDC * IRAC)
-            long redAC = pulseRed.avgAC();
-            long redDC = pulseRed.avgDC();
-            long irAC = pulseIR.avgAC();
-            long irDC = pulseIR.avgDC();
+    // Record ECG-style waveform (triggers PQRST pattern on beat detection)
+    wave.record(beatDetected);
 
-            // Validate all values to prevent division by zero
-            if (redDC > 0 && irAC > 0 && irDC > 0 && redAC >= 0) {
-              // Calculate R * 100 to preserve precision
-              // Reordered to prevent overflow: (redAC * 100 / redDC) * irDC / irAC
-              long R_x100 = ((redAC * 100) / redDC) * irDC / irAC;
-              // SpO2 = 104 - 17 * R  (standard linear approximation)
-              // Clamp to valid range 0-100
-              int spo2_calc = 104 - (17 * R_x100) / 100;
-              if (spo2_calc > 100) spo2_calc = 100;
-              if (spo2_calc < 0) spo2_calc = 0;
-              SPO2 = spo2_calc;
+    if (beatDetected) {
+        unsigned long now = millis();
+        unsigned long timeSinceLastBeat = now - lastBeatTime;
+
+        // Avoid division by zero and ignore first beat (no valid interval yet)
+        if (lastBeatTime > 0 && timeSinceLastBeat > 0) {
+            long btpm = 60000 / timeSinceLastBeat;
+            if (btpm > 0 && btpm < MAX_BPM) {
+                beatAvg = bpm.filter((int16_t)btpm);
             }
         }
-        // update temperature periodically
-        if (now - tempReadTime > TEMP_READ_INTERVAL) {
-            tempReadTime = now;
-            temperature = readTemperatureFiltered();
+        lastBeatTime = now;
+
+        // IMMEDIATE buzzer and LED response - no delay!
+        digitalWrite(LED, HIGH);
+        digitalWrite(BUZZER, HIGH);
+
+        // Schedule buzzer off task (one-shot, will turn off after BEAT_FLASH_DURATION)
+        taskBuzzerOff.restartDelayed(BEAT_FLASH_DURATION * 1000);  // microseconds
+
+        // Compute SpO2
+        long redAC = pulseRed.avgAC();
+        long redDC = pulseRed.avgDC();
+        long irAC = pulseIR.avgAC();
+        long irDC = pulseIR.avgDC();
+
+        if (redDC > 0 && irAC > 0 && irDC > 0 && redAC >= 0) {
+            long R_x100 = ((redAC * 100) / redDC) * irDC / irAC;
+            int spo2_calc = 104 - (17 * R_x100) / 100;
+            if (spo2_calc > 100) spo2_calc = 100;
+            if (spo2_calc < 0) spo2_calc = 0;
+            SPO2 = spo2_calc;
         }
-        // update display periodically if finger down
-        if (now - displaytime > DISPLAY_INTERVAL) {
-            displaytime = now;
-            draw_oled(2);
+    }
+}
+
+/*
+ * DISPLAY TASK - Low priority, runs every 50ms (20Hz)
+ * Uses incremental page-by-page drawing with sensor yields between pages
+ */
+void displayCallback() {
+    int displayMode = fingerPresent ? 2 : 1;
+
+    oled.firstPage();
+    do {
+        // Draw current page content
+        switch(displayMode) {
+            case 1:  // Place finger message
+                oled.drawStr(28,20,F("PLACE"),2);
+                oled.drawStr(22,40,F("FINGER"),2);
+                break;
+            case 2:  // Main display with waveform
+                oled.drawXBMP(0,0,16,16,heart_bits);
+                print_digit(18,0,beatAvg,' ',3,2);
+                oled.drawStr(56,0,F("O2"),1);
+                print_digit(72,0,SPO2,' ',3,2);
+                oled.drawChar(108,0,'%',2);
+                oled.drawStr(56,10,F("T"),1);
+                print_digit(64,10,temperature,' ',2,1);
+                oled.drawChar(76,10,'C');
+                for (int i=0; i<128; i+=2) {
+                    oled.drawPixel(i, 13);
+                }
+                wave.draw(0);
+                break;
         }
-    }
-    // flash led and buzzer briefly
-    if (led_on && (now - lastBeat) > BEAT_FLASH_DURATION) {
-        digitalWrite(LED, LOW);
-        led_on = false;
-    }
-    if (buzzer_on && (now - lastBeat) > BEAT_FLASH_DURATION) {
-        digitalWrite(BUZZER, LOW);
-        buzzer_on = false;
-    }
+
+        // CRITICAL: Run sensor scheduler between each OLED page write
+        // This ensures we don't miss any beats during slow I2C transfers
+        sensorScheduler.execute();
+
+    } while (oled.nextPage());
+}
+
+/*
+ * TEMPERATURE TASK - Low priority, runs every 1 second
+ * Reads LM35 temperature sensor
+ */
+void tempCallback() {
+    temperature = readTemperatureFiltered();
+}
+
+/*
+ * BUZZER OFF TASK - One-shot, triggered by beat detection
+ * Turns off LED and buzzer after BEAT_FLASH_DURATION
+ */
+void buzzerOffCallback() {
+    digitalWrite(LED, LOW);
+    digitalWrite(BUZZER, LOW);
 }
