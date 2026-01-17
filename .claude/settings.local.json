@@ -3,7 +3,9 @@
     "allow": [
       "Bash(dir /b \"C:\\\\Users\\\\satui\\\\OneDrive\\\\Documents\\\\Arduino\\\\libraries\")",
       "mcp__context7__resolve-library-id",
-      "mcp__context7__query-docs"
+      "mcp__context7__query-docs",
+      "Bash(dir \"C:\\\\Users\\\\satui\\\\OneDrive\\\\Documents\\\\Arduino\\\\libraries\" /b)",
+      "Bash(findstr:*)"
     ]
   }
 }
