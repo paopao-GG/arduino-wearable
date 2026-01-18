@@ -5,7 +5,12 @@
       "mcp__context7__resolve-library-id",
       "mcp__context7__query-docs",
       "Bash(dir \"C:\\\\Users\\\\satui\\\\OneDrive\\\\Documents\\\\Arduino\\\\libraries\" /b)",
-      "Bash(findstr:*)"
+      "Bash(findstr:*)",
+      "Bash(git remote add:*)",
+      "Bash(ls:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)"
     ]
   }
 }

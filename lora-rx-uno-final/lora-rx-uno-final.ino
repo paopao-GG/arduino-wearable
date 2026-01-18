@@ -12,10 +12,10 @@
 // RST   -> D9
 // DIO0  -> D2
 //
-// Wiring: Alert LED
+// Wiring: Signal to Arduino 2
 // -----------------------------------------
-// LED+  -> D8 (through 220-330 ohm resistor)
-// LED-  -> GND
+// D8 (OUTPUT) -> Arduino 2 D8 (INPUT)
+// GND         -> Arduino 2 GND (common ground required!)
 //
 // NOTE: SX1278 is NOT 5V tolerant on VCC!
 //       SPI pins can tolerate 5V, but for safety consider level shifters.
@@ -29,7 +29,7 @@
 #define LORA_RST   9
 #define LORA_DIO0  2
 
-#define ALERT_LED  8   // Alert indicator LED
+#define SIGNAL_PIN  8   // Signal output to Arduino 2
 
 // ============ CONSTANTS ============
 const long LORA_FREQ = 433E6;
@@ -44,8 +44,8 @@ String alertType = "";
 
 // ============ SETUP ============
 void setup() {
-  pinMode(ALERT_LED, OUTPUT);
-  digitalWrite(ALERT_LED, LOW);
+  pinMode(SIGNAL_PIN, OUTPUT);
+  digitalWrite(SIGNAL_PIN, LOW);
 
   Serial.begin(9600);
   delay(1000);
@@ -60,11 +60,11 @@ void setup() {
   if (!LoRa.begin(LORA_FREQ)) {
     Serial.println(F("ERROR: LoRa init failed!"));
     Serial.println(F("Check: wiring, antenna, power"));
-    // Blink LED rapidly to indicate error
+    // Signal error rapidly to indicate issue
     while (1) {
-      digitalWrite(ALERT_LED, HIGH);
+      digitalWrite(SIGNAL_PIN, HIGH);
       delay(100);
-      digitalWrite(ALERT_LED, LOW);
+      digitalWrite(SIGNAL_PIN, LOW);
       delay(100);
     }
   }
@@ -142,8 +142,8 @@ void processMessage(String msg) {
       receivedTemp = alertType.substring(tempIdx + 5, endIdx).toInt();
     }
 
-    // Turn ON LED when alert received
-    digitalWrite(ALERT_LED, HIGH);
+    // Send HIGH signal to Arduino 2
+    digitalWrite(SIGNAL_PIN, HIGH);
 
     Serial.println();
     Serial.println(F("*** ALERT RECEIVED! ***"));
@@ -156,7 +156,7 @@ void processMessage(String msg) {
       Serial.print(receivedTemp);
       Serial.println(F(" C"));
     }
-    Serial.println(F("LED ON"));
+    Serial.println(F("SIGNAL ON -> Arduino 2"));
     Serial.println(F("***********************"));
     Serial.println();
 
@@ -167,12 +167,12 @@ void processMessage(String msg) {
     receivedTemp = 0;
     alertType = "";
 
-    // Turn OFF LED when clear received
-    digitalWrite(ALERT_LED, LOW);
+    // Send LOW signal to Arduino 2
+    digitalWrite(SIGNAL_PIN, LOW);
 
     Serial.println();
     Serial.println(F("=== ALERT CLEARED ==="));
-    Serial.println(F("LED OFF"));
+    Serial.println(F("SIGNAL OFF -> Arduino 2"));
     Serial.println();
   }
 }

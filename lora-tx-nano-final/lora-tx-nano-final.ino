@@ -449,6 +449,14 @@ void buzzerOffCallback() {
 
 // ============ ALERT CHECK TASK (NON-BLOCKING) ============
 void alertCheckCallback() {
+  // Once alert is sent, LATCH it - do not auto-clear
+  // User must manually reset the device to clear the alert
+
+  if (alertSent) {
+    // Alert already sent and latched, do nothing
+    return;
+  }
+
   unsigned long now = millis();
 
   // Check BPM threshold
@@ -473,23 +481,17 @@ void alertCheckCallback() {
     tempAlertStartTime = 0;
   }
 
-  // Check if either condition has been sustained for 30 seconds
+  // Check if either condition has been sustained for required duration
   bool bpmSustained = bpmAlertActive && (now - bpmAlertStartTime >= ALERT_DURATION_MS);
   bool tempSustained = tempAlertActive && (now - tempAlertStartTime >= ALERT_DURATION_MS);
 
-  if ((bpmSustained || tempSustained) && !alertSent) {
-    // Send alert via LoRa
+  if (bpmSustained || tempSustained) {
+    // Send alert via LoRa and LATCH
     sendAlert(bpmSustained, tempSustained);
     alertSent = true;
-  }
 
-  // Reset alertSent when conditions return to normal
-  if (!bpmAlertActive && !tempAlertActive) {
-    if (alertSent) {
-      // Send "clear" signal
-      sendClear();
-      alertSent = false;
-    }
+    Serial.println(F("ALERT LATCHED - Reset device to clear"));
+    // Alert stays active until device reset
   }
 }
 
@@ -518,13 +520,4 @@ void sendAlert(bool bpmAlert, bool tempAlert) {
   LoRa.endPacket();  // Non-async for reliability
 
   Serial.println(F(" ... sent!"));
-}
-
-// ============ SEND CLEAR (NON-BLOCKING) ============
-void sendClear() {
-  Serial.println(F("Conditions normal, sending CLEAR"));
-
-  LoRa.beginPacket();
-  LoRa.print(F("CLEAR"));
-  LoRa.endPacket();
 }

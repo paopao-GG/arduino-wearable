@@ -182,12 +182,202 @@ void loop() {
 | 3 | Startup | "PULSE OX MONITOR" |
 
 ## Potential Future Improvements
+- [x] Add abnormal heart rate alerts - ✓ Implemented via LoRa
 - [ ] Add low SpO2 alarm (< 90%)
-- [ ] Add abnormal heart rate alerts
 - [ ] Battery level indicator
 - [ ] Data logging to SD card
 - [ ] Bluetooth connectivity
 - [ ] Adjust ECG pattern heights for visual preference
 
 ---
-*Last updated: 2026-01-17*
+
+# LoRa Alert System - Extended Project
+
+## Project Overview
+Extended the pulse oximeter with LoRa wireless alert transmission system.
+
+**Architecture:**
+- **Transmitter**: Arduino Nano + MAX30102 + OLED + LoRa RA-02
+- **Receiver**: Arduino UNO + LoRa RA-02 + Alert LED
+
+## Hardware Components - LoRa System
+
+### Transmitter (Arduino Nano)
+| Component | Pin | Description |
+|-----------|-----|-------------|
+| LoRa RA-02 VCC | External 3.3V | **CRITICAL**: Nano's 3.3V cannot supply ~120mA TX current |
+| LoRa NSS | D10 | SPI Chip Select |
+| LoRa MOSI/MISO/SCK | D11/D12/D13 | Hardware SPI (fixed pins) |
+| LoRa RST | D9 | Reset |
+| LoRa DIO0 | D2 | Interrupt |
+| MAX30102 + OLED | I2C (A4/A5) | Shared I2C bus |
+| LM35 | A0 | Temperature sensor |
+| Buzzer | D3 | Heartbeat feedback |
+
+### Receiver (Arduino UNO)
+| Component | Pin | Description |
+|-----------|-----|-------------|
+| LoRa RA-02 VCC | 3.3V | UNO's 3.3V is sufficient for RX-only (~50mA) |
+| LoRa NSS | D10 | SPI Chip Select |
+| LoRa MOSI/MISO/SCK | D11/D12/D13 | Hardware SPI (fixed pins) |
+| LoRa RST | D9 | Reset |
+| LoRa DIO0 | D2 | Interrupt |
+| Alert LED | D8 | Alert indicator (220-330Ω resistor) |
+
+## LoRa Configuration (433 MHz)
+Both transmitter and receiver use matching settings:
+
+```cpp
+LoRa.setTxPower(20);             // 20 dBm max power
+LoRa.setSpreadingFactor(10);     // SF10 - better noise immunity
+LoRa.setSignalBandwidth(125E3);  // 125 kHz
+LoRa.setCodingRate4(8);          // 4/8 - max error correction
+LoRa.enableCrc();                // Enable CRC checking
+LoRa.setSyncWord(0x12);          // Private sync word (filter noise)
+```
+
+**Why SF10?** Better noise immunity than SF7, suitable for medical alerts where reliability > speed.
+
+## Alert Logic (Transmitter)
+
+### Alert Thresholds
+```cpp
+#define ALERT_BPM_THRESHOLD 100   // Testing value (production: 120)
+#define ALERT_TEMP_THRESHOLD 40   // 40°C
+#define ALERT_DURATION_MS 3000    // Testing value (production: 30000)
+```
+
+### State Machine
+```
+Normal vitals → No transmission
+    ↓
+BPM >= 100 for 3s → Send "ALERT:BPM=xxx" (ONE packet)
+    ↓ or
+Temp >= 40°C for 3s → Send "ALERT:TEMP=xx" (ONE packet)
+    ↓ or both
+BPM + Temp alert → Send "ALERT:BPM=xxx,TEMP=xx" (ONE packet)
+    ↓
+Alert stays active → No repeated sends (event-driven, not periodic)
+    ↓
+Both conditions normal → Send "CLEAR" (ONE packet)
+```
+
+### Non-Blocking Alert Check
+Uses TaskScheduler with 500ms check interval:
+```cpp
+Task taskAlertCheck(500000, TASK_FOREVER, &alertCheckCallback, &displayScheduler, true);
+```
+
+**Key behavior:**
+- `alertSent` flag prevents repeated transmissions
+- Sustained threshold required (not instant trigger)
+- CLEAR sent only when **both** BPM and temp return to normal
+- Conservative design for medical safety
+
+## Receiver Behavior
+
+### LED States
+| LED State | Trigger | Meaning |
+|-----------|---------|---------|
+| OFF | Normal | No alerts |
+| ON (solid) | `ALERT:` received | High BPM and/or high temp |
+| OFF | `CLEAR` received | All vitals normal |
+
+### Message Format
+Receiver parses three message types:
+1. `ALERT:BPM=xxx` - High heart rate only
+2. `ALERT:TEMP=xx` - High temperature only
+3. `ALERT:BPM=xxx,TEMP=xx` - Both conditions
+4. `CLEAR` - All clear
+
+## File Locations
+
+### Final Implementation
+- **Transmitter**: `lora-tx-nano-final/lora-tx-nano-final.ino`
+- **Receiver**: `lora-rx-uno-final/lora-rx-uno-final.ino`
+
+### Test Files (basic LoRa communication)
+- `lora-tx-nano/lora-tx-nano.ino` - Simple transmitter test
+- `lora-rx-uno/lora-rx-uno.ino` - Simple receiver test
+
+## TaskScheduler Architecture (Transmitter)
+
+### Priority Schedulers
+```cpp
+Scheduler sensorScheduler;   // HIGH priority - critical timing
+Scheduler displayScheduler;  // LOW priority - can be delayed
+
+displayScheduler.setHighPriorityScheduler(&sensorScheduler);
+```
+
+**Why two schedulers?**
+- Sensor runs every 4ms (250Hz) - MUST NOT be delayed
+- Display updates are slow (~50ms) but sensor still runs during OLED I2C transfers
+- This prevents missing heartbeats during display refresh
+
+### Task Breakdown (Transmitter)
+| Task | Interval | Scheduler | Purpose |
+|------|----------|-----------|---------|
+| `taskSensor` | 4ms | sensorScheduler | Read MAX30102, detect beats, compute BPM/SpO2 |
+| `taskBuzzerOff` | 30ms (one-shot) | sensorScheduler | Turn off LED/buzzer |
+| `taskDisplay` | 50ms | displayScheduler | Update OLED (yields to sensor between pages) |
+| `taskTemp` | 1s | displayScheduler | Read LM35 temperature |
+| `taskAlertCheck` | 500ms | displayScheduler | Check alert thresholds, send LoRa |
+
+## Libraries Required (LoRa System)
+
+### Transmitter
+- `LoRa` by Sandeep Mistry (v0.8.0)
+- `TaskScheduler`
+- `ssd1306h`, `MAX30102`, `Pulse` (from original project)
+
+### Receiver
+- `LoRa` by Sandeep Mistry (v0.8.0)
+
+## Common Pitfalls & Solutions
+
+### ❌ Problem: Transmitter not sending
+**Cause**: `while (!Serial);` blocks forever if Serial Monitor not open
+**Fix**: Changed to `delay(1000);`
+
+### ❌ Problem: Garbled data received
+**Symptoms**: SNR = -16 dB (signal below noise), RSSI +27 dBm (impossible)
+**Causes**: No antenna, modules too close, frequency mismatch
+**Fix**:
+- Added 17.3cm wire antenna (433MHz λ/4)
+- Increased SF from 7 to 10
+- Increased coding rate to 4/8
+- Added sync word 0x12
+
+### ❌ Problem: Nano 3.3V can't power LoRa
+**Cause**: LoRa TX needs ~120mA peak, Nano's 3.3V regulator supplies ~50mA
+**Fix**: Use external AMS1117-3.3V regulator
+
+## BPM Detection Accuracy
+
+The BPM calculation is standard but accuracy depends on:
+1. **Finger placement stability** - movement causes false beats
+2. **FINGER_THRESHOLD (5000)** - may need tuning
+3. **Pulse library's beat detection algorithm** - uses MA filter
+
+```cpp
+// Beat-to-beat interval calculation
+long btpm = 60000 / timeSinceLastBeat;
+beatAvg = bpm.filter((int16_t)btpm);  // MAFilter smooths fluctuations
+```
+
+## GitHub Repository
+Pushed to: https://github.com/paopao-GG/arduino-wearable.git
+
+## Power Consumption Notes
+- **Transmitter (event-driven)**:
+  - Idle: Sensor (250Hz) + OLED refresh = ~30mA continuous
+  - Alert TX: +120mA burst (~100ms) per transmission
+  - Very low RF traffic (1-2 packets per alert event)
+
+- **Receiver (listen-only)**:
+  - LoRa RX mode: ~15mA continuous
+  - No power-hungry peripherals
+
+---
+*Last updated: 2026-01-18*
